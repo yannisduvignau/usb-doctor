@@ -8,20 +8,45 @@ dead drive.
 
 ## How to run it
 
+Nothing to install and nothing to clone.
+
 1. Plug in the USB drive.
 2. Open **Terminal** (press `Cmd + Space`, type `Terminal`, press Enter).
 3. Copy and paste this line, then press Enter:
 
-   ```
-   cd ~/Projects/github/usb_debug && ./usb-doctor.sh
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/yannisduvignau/usb-doctor/main/usb-doctor.sh -o /tmp/usb-doctor.sh && bash /tmp/usb-doctor.sh; rm -f /tmp/usb-doctor.sh
    ```
 
 4. Answer the questions as they come up.
+
+The script downloads, runs, and deletes itself — including if you press
+Ctrl+C partway through.
 
 It will ask for your Mac password at the start. That is expected: macOS
 requires administrator rights to read a disk sector by sector. Without
 them the script cannot tell a healthy drive from a failing one, so it
 warns and skips those tests rather than guessing.
+
+### Why not `curl … | bash`
+
+The usual one-liner pipes the script straight into `bash`. That does not
+work here: this script is interactive, and piping it makes `bash` read the
+script itself from standard input, leaving nothing for the keyboard. The
+prompts would scroll past unanswered.
+
+Writing to a temporary file first keeps standard input free for your
+answers. The `;` before `rm` is deliberate rather than a typo — with `&&`,
+an interrupted run would leave the file behind.
+
+### Running it from a local copy
+
+If you have cloned the repository:
+
+```bash
+git clone https://github.com/yannisduvignau/usb-doctor.git
+cd usb-doctor && ./usb-doctor.sh
+```
 
 ## What it does
 
