@@ -56,11 +56,31 @@ It runs in four stages and stops to ask before anything irreversible.
 |---|---|---|
 | 1. Diagnose | Reads the drive, checks the partition table and filesystem | None — read-only |
 | 2. Back up | Copies the whole drive to an image file on the Desktop | None to the drive |
-| 3. Repair | Fixes the filesystem | Writes to the drive — asks first |
+| 3. Repair | Fixes the filesystem | Writes to the drive |
 | 4. Clean up | Removes anything it installed | None |
 
-**Nothing is written to the drive unless you type `REPAIR` in full.** Pressing
-Enter by reflex cancels instead of proceeding.
+Stages 2 and 3 only run if stage 1 finds a problem. A healthy drive stops
+after the diagnosis.
+
+### What you actually have to do
+
+Two things: enter your Mac password, and confirm which drive to work on
+(`y`, or a number if several external disks are plugged in). Everything
+after that is decided automatically.
+
+### How the repair decides
+
+Repairing writes to the drive and can, in rare cases, discard files that
+were already damaged. So it only runs automatically **once the backup image
+exists**:
+
+- Enough free space → the image is created, then the repair runs.
+- Not enough space, or the copy failed → **the repair does not run.** The
+  script says why and prints the manual command, rather than risking data
+  that may have no other copy.
+
+The image needs as much free space as the drive's *total* size — a 64 GB
+drive needs 64 GB free, even if it holds only a few files.
 
 Everything it finds is saved to a folder on your Desktop named
 `usb-doctor-<date>`, containing a full `report.txt`.
@@ -86,9 +106,13 @@ tool it needs for FAT32, exFAT, HFS+ and APFS drives — `diskutil`,
 `fsck_msdos`, `fsck_exfat`, `fsck_hfs`, `gpt` and `dd`.
 
 There is one exception. macOS can read **NTFS** drives but has no tool to
-repair them. If a damaged NTFS partition is found, the script asks before
-installing `ntfs-3g` via Homebrew, and removes it again when it exits —
+repair them. If a damaged NTFS partition is found and Homebrew is already
+installed, the script installs `ntfs-3g` and removes it again when it exits —
 including if you press Ctrl+C partway through.
+
+If Homebrew is *not* installed, the script skips this rather than installing
+it. Homebrew is a large, permanent addition to the system, and `ntfsfix`
+does not truly repair NTFS anyway — so it would be a poor trade.
 
 Be aware that `ntfs-3g` only flags an NTFS volume for a later scan; it does
 not truly repair it. For NTFS, the reliable fix is a Windows PC:

@@ -4,13 +4,18 @@
 #
 # Usage:  ./usb-doctor.sh
 #
-# Interactive, four stages:
+# Four stages, decided automatically from what is detected:
 #   1. Diagnose  — read-only, cannot damage anything
-#   2. Back up   — full disk image, strongly advised before any repair
-#   3. Repair    — writes to the drive, requires typed confirmation
+#   2. Back up   — full disk image, if a fault was found and space allows
+#   3. Repair    — only if that backup image was created successfully
 #   4. Clean up  — removes any package the script installed
 #
-# Nothing is ever written to the drive without an explicit typed confirmation.
+# The only input required is the Mac password, plus confirming which drive to
+# work on. Everything after that is automatic.
+#
+# The backup gates the repair on purpose: repairing writes to the drive and can
+# discard already-damaged files. With no image to fall back on, the script
+# stops and prints the manual command instead of risking irreplaceable data.
 #
 # Design note: macOS ships every tool needed for FAT32, exFAT, HFS+ and APFS
 # (diskutil, fsck_msdos, fsck_exfat, fsck_hfs, gpt, dd). The only case that
@@ -55,17 +60,6 @@ ask() {
     read -r answer </dev/tty
     [ -n "$LOG" ] && printf '\n>>> %s -> %s\n' "$prompt" "$answer" >> "$LOG"
     case "$answer" in [yYoO]*) return 0 ;; *) return 1 ;; esac
-}
-
-# Requires typing an exact word. Guards against a reflexive Enter keypress
-# on the one prompt that authorises writing to the drive.
-ask_typed() {
-    local prompt="$1" expected="$2" answer
-    printf '\n%s%s%s\n' "$B" "$prompt" "$N"
-    printf 'Type %s%s%s to confirm (anything else cancels): ' "$B" "$expected" "$N"
-    read -r answer </dev/tty
-    [ -n "$LOG" ] && printf '\n>>> confirmation %s -> %s\n' "$expected" "$answer" >> "$LOG"
-    [ "$answer" = "$expected" ]
 }
 
 die() { say ""; bad "$*"; say ""; exit 1; }
@@ -366,22 +360,41 @@ fi
 # Stage 5 — back up before writing anything
 # ─────────────────────────────────────────────────────────────────────────────
 IMAGE_DONE=0
+BACKUP_SKIP_REASON=""
 if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; then
-    title "5. Backup (strongly recommended)"
+    title "5. Backup"
 
-    say "Before any repair, copy the whole drive into an image file. If the"
-    say "repair goes wrong, everything stays recoverable from that image."
+    say "A problem was found, so the whole drive is copied into an image file"
+    say "first. If the repair goes wrong, everything stays recoverable."
     say ""
+
+    # Compare in bytes rather than the human-readable strings, so the decision
+    # is exact. Both values are parsed from their respective tools' output.
     DISKSIZE=$(diskutil info "$DISK" 2>/dev/null | awk -F': *' '/Disk Size/{print $2; exit}')
+    DISKBYTES=$(diskutil info "$DISK" 2>/dev/null | awk -F'[()]' '/Disk Size/{print $2}' | awk '{print $1}')
+    FREEBYTES=$(( $(df -k "$HOME" | tail -1 | awk '{print $4}') * 1024 ))
+
     say "Size to copy: ${B}${DISKSIZE:-unknown}${N}"
+    say "Free space:   ${B}$(( FREEBYTES / 1000000000 )) GB${N}"
     say "Destination:  ${C}$LOGDIR/drive-image.dmg${N}"
-    say ""
-    say "${DIM}Free space on this Mac must exceed that size:${N}"
-    df -h "$HOME" | tail -1 | sed 's/^/  /' | tee -a "$LOG"
+
+    # A margin over the exact size, so the copy cannot fill the startup disk.
+    NEEDED=$(( ${DISKBYTES:-0} + 1000000000 ))
 
     if [ "$SUDO_OK" -eq 0 ]; then
-        warn "Backup needs administrator rights — skipped."
-    elif ask "Create the backup image now?"; then
+        BACKUP_SKIP_REASON="administrator rights were not granted"
+        warn "Backup skipped — $BACKUP_SKIP_REASON"
+    elif [ -z "$DISKBYTES" ] || [ "$DISKBYTES" -eq 0 ]; then
+        BACKUP_SKIP_REASON="the drive size could not be determined"
+        warn "Backup skipped — $BACKUP_SKIP_REASON"
+    elif [ "$FREEBYTES" -lt "$NEEDED" ]; then
+        BACKUP_SKIP_REASON="this Mac does not have enough free space"
+        warn "Backup skipped — $BACKUP_SKIP_REASON"
+        say ""
+        say "  Free up about $(( (NEEDED - FREEBYTES) / 1000000000 + 1 )) GB and run this again,"
+        say "  or copy the drive to an external disk from a Windows PC first."
+    else
+        ok "Enough free space — creating the image automatically"
         say ""
         info "Unmounting the drive..."
         diskutil unmountDisk "$DISK" >/dev/null 2>&1
@@ -403,10 +416,12 @@ if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; t
             IMAGE_DONE=1
         else
             warn "The copy finished with errors (see the report)."
-            [ -f "$LOGDIR/drive-image.dmg" ] && IMAGE_DONE=1
+            if [ -f "$LOGDIR/drive-image.dmg" ]; then
+                IMAGE_DONE=1
+            else
+                BACKUP_SKIP_REASON="the backup copy failed"
+            fi
         fi
-    else
-        warn "Backup skipped. Any repair will run without a safety net."
     fi
 fi
 
@@ -418,14 +433,27 @@ if [ "$NEED_REPAIR" -eq 1 ] && [ "$SUDO_OK" -eq 1 ]; then
 
     say "Affected partition(s): ${B}${BROKEN_PARTS[*]}${N}"
     say ""
-    say "${Y}Repair writes to the drive.${N} In rare cases it can discard files"
-    say "that were already damaged."
-    if [ "$IMAGE_DONE" -eq 0 ]; then
+
+    # Repair writes to the drive and can discard already-damaged files, so it
+    # only runs automatically when the backup image exists. Without that safety
+    # net the script stops and hands the decision back to the user, rather than
+    # risking data that may have no other copy.
+    if [ "$IMAGE_DONE" -eq 1 ]; then
+        ok "Backup image exists — repairing automatically"
+        DO_REPAIR=1
+    else
+        bad "No backup image (${BACKUP_SKIP_REASON:-reason unknown})"
         say ""
-        warn "No backup image was created."
+        say "${Y}Repair is NOT running automatically.${N}"
+        say "It writes to the drive and can discard files that are already"
+        say "damaged — too risky without a backup."
+        say ""
+        say "To repair anyway, run this in Terminal:"
+        say "  ${C}sudo diskutil repairVolume ${BROKEN_PARTS[0]}${N}"
+        DO_REPAIR=0
     fi
 
-    if ask_typed "Run the repair?" "REPAIR"; then
+    if [ "$DO_REPAIR" -eq 1 ]; then
         for DEV in "${BROKEN_PARTS[@]}"; do
             FSTYPE=$(diskutil info "$DEV" 2>/dev/null | awk -F': *' '/Type \(Bundle\)/{print $2; exit}')
             say ""
@@ -437,44 +465,42 @@ if [ "$NEED_REPAIR" -eq 1 ] && [ "$SUDO_OK" -eq 1 ]; then
                 info "NTFS: macOS provides no repair tool for this filesystem."
                 info "An external utility (ntfs-3g) is required."
 
-                if ask "Install ntfs-3g temporarily? (removed automatically on exit)"; then
-                    if ! command -v brew >/dev/null 2>&1; then
-                        for cand in /opt/homebrew/bin/brew /usr/local/bin/brew; do
-                            [ -x "$cand" ] && eval "$("$cand" shellenv)" && break
-                        done
-                    fi
+                # Homebrew is used only if it is already present. Installing it
+                # automatically would be a heavy, lasting change to the system —
+                # out of proportion here, especially since ntfsfix does not
+                # truly repair NTFS anyway.
+                if ! command -v brew >/dev/null 2>&1; then
+                    for cand in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+                        [ -x "$cand" ] && eval "$("$cand" shellenv)" && break
+                    done
+                fi
 
-                    if ! command -v brew >/dev/null 2>&1; then
-                        warn "Homebrew is not installed."
-                        say "  To install it:"
-                        say "  ${C}/bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"${N}"
-                        warn "NTFS repair is not possible without it."
-                    else
-                        info "Installing ntfs-3g-mac..."
-                        if brew install ntfs-3g-mac >>"$LOG" 2>&1; then
-                            INSTALLED_BY_US+=("ntfs-3g-mac")
-                            ok "ntfs-3g-mac installed (temporarily)"
-                            diskutil unmount "$DEV" >/dev/null 2>&1
-                            NTFSFIX=$(command -v ntfsfix || echo "$(brew --prefix)/bin/ntfsfix")
-                            if [ -x "$NTFSFIX" ]; then
-                                sudo "$NTFSFIX" -d "$DEV" 2>&1 | tee -a "$LOG" | sed 's/^/  /'
-                                ok "ntfsfix finished"
-                                say ""
-                                warn "ntfsfix only flags the volume for a later scan."
-                                warn "For a real NTFS repair, plug the drive into a PC and run:"
-                                warn "  chkdsk X: /f"
-                            fi
+                if command -v brew >/dev/null 2>&1; then
+                    ok "Homebrew found — installing ntfs-3g temporarily"
+                    if brew install ntfs-3g-mac >>"$LOG" 2>&1; then
+                        INSTALLED_BY_US+=("ntfs-3g-mac")
+                        ok "ntfs-3g-mac installed (removed on exit)"
+                        diskutil unmount "$DEV" >/dev/null 2>&1
+                        NTFSFIX=$(command -v ntfsfix || echo "$(brew --prefix)/bin/ntfsfix")
+                        if [ -x "$NTFSFIX" ]; then
+                            sudo "$NTFSFIX" -d "$DEV" 2>&1 | tee -a "$LOG" | sed 's/^/  /'
+                            ok "ntfsfix finished"
                         else
-                            warn "Could not install ntfs-3g-mac (see the report)."
-                            say "  The most reliable NTFS fix remains a Windows PC:"
-                            say "  an admin Command Prompt, then ${B}chkdsk X: /f${N}"
+                            warn "ntfsfix not found after install."
                         fi
+                    else
+                        warn "Could not install ntfs-3g-mac (see the report)."
                     fi
                 else
-                    info "Installation declined."
-                    say "  For NTFS, the reference repair is, on a PC:"
-                    say "  ${B}chkdsk X: /f${N}"
+                    info "Homebrew is not installed — skipping ntfs-3g."
+                    info "It is not installed automatically: that would be a large,"
+                    info "lasting change to the Mac for little benefit here."
                 fi
+
+                say ""
+                warn "NTFS note: ntfsfix only flags the volume for a later scan;"
+                warn "it does not truly repair it. The reliable fix is a Windows PC:"
+                warn "  chkdsk X: /f"
             else
                 # FAT / exFAT / HFS+ / APFS — native macOS tools, nothing to install.
                 diskutil unmount "$DEV" >/dev/null 2>&1
@@ -514,7 +540,7 @@ if [ "$NEED_REPAIR" -eq 1 ] && [ "$SUDO_OK" -eq 1 ]; then
             fi
         done
     else
-        info "Repair cancelled. Nothing was written to the drive."
+        info "Nothing was written to the drive."
     fi
 fi
 
