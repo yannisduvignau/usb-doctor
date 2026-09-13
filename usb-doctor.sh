@@ -77,6 +77,104 @@ disk_size() {
         | awk -F' \\(' '{print $1}'
 }
 
+# USB devices currently on the bus, hubs and built-in peripherals filtered
+# out. Sees the hardware even when no /dev/diskN exists for it, which is what
+# separates an ejected drive from an absent one.
+usb_devices() {
+    ioreg -p IOUSB -w0 2>/dev/null \
+        | grep -oE '\+-o [^@]+@' \
+        | sed 's/^+-o //; s/@$//' \
+        | grep -viE 'hub|root|xhci|composite|keyboard|mouse|trackpad|camera|audio|receiver|bluetooth'
+}
+
+# Waits for a drive to appear, for those cases where the user has to unplug
+# and replug. Prints a countdown; returns 0 as soon as one shows up.
+wait_for_disk() {
+    local timeout="$1" waited=0 found=""
+    # The countdown is drawn only on a real terminal; redirecting to /dev/tty
+    # is itself an error when there is none.
+    local tty_ok=0
+    [ -t 1 ] && tty_ok=1
+
+    while [ "$waited" -lt "$timeout" ]; do
+        found=$(diskutil list external physical 2>/dev/null | grep -Eo '^/dev/disk[0-9]+' | head -1)
+        if [ -n "$found" ]; then
+            [ "$tty_ok" -eq 1 ] && printf '\r%-60s\r' ""
+            return 0
+        fi
+        [ "$tty_ok" -eq 1 ] && printf '\r  Waiting for the drive... %ds ' "$(( timeout - waited ))"
+        sleep 2
+        waited=$(( waited + 2 ))
+    done
+    [ "$tty_ok" -eq 1 ] && printf '\r%-60s\r' ""
+    return 1
+}
+
+# Diagnosis for a drive macOS never presents as a disk. Nothing can be
+# repaired here, so the job is to narrow down where the fault is — the drive,
+# the port, or whatever sits between them.
+diagnose_absent() {
+    say "${B}What the Mac can still tell us${N}"
+    say ""
+
+    # A hub or adapter in the chain is worth naming: they are a common cause,
+    # and the fix (plug in directly) costs nothing to try.
+    local hubs
+    hubs=$(ioreg -p IOUSB -w0 -l 2>/dev/null \
+        | grep -E '"USB Product Name"' | grep -i hub \
+        | sed 's/.*= "//; s/"$//' | sort -u | head -3)
+
+    if [ -n "$hubs" ]; then
+        warn "A USB hub or adapter is in use:"
+        printf '%s\n' "$hubs" | sed 's/^/      /' | tee -a "$LOG"
+        say ""
+        say "  ${B}Try the drive plugged straight into the Mac${N}, with no hub,"
+        say "  dock or extension cable. This alone fixes many cases —"
+        say "  especially where the drive works on a PC but on no Mac."
+        say ""
+    else
+        info "No hub or adapter detected — the drive is on a direct port."
+        say ""
+    fi
+
+    # Recent USB errors name the fault when there is one.
+    local usberr
+    usberr=$(log show --last 3m --predicate 'subsystem CONTAINS "usb"' --style compact 2>/dev/null \
+        | grep -iE 'error|fail|reject|terminat|overcurrent|not enough power' \
+        | tail -6)
+
+    if [ -n "$usberr" ]; then
+        warn "Recent USB errors:"
+        printf '%s\n' "$usberr" | cut -c1-110 | sed 's/^/      /' | tee -a "$LOG"
+        say ""
+        if printf '%s' "$usberr" | grep -qi 'power\|overcurrent'; then
+            say "  ${B}A power problem.${N} The drive is drawing more than the port"
+            say "  provides. Use a powered hub, or a port on the Mac itself."
+            say ""
+        fi
+    else
+        info "No USB errors logged in the last 3 minutes."
+        say ""
+    fi
+
+    say "${B}Where the fault is${N}"
+    say ""
+    say "  The Mac never presented this drive as a disk, so there is no"
+    say "  filesystem to repair — the problem is below that level."
+    say ""
+    say "  ${B}1.${N} Try every port on the Mac, with no hub or adapter"
+    say "  ${B}2.${N} Try a different cable, if the drive uses one"
+    say "  ${B}3.${N} Try the drive on another Mac"
+    say ""
+    say "  If it works on Windows but on no Mac, and a direct port changes"
+    say "  nothing, the drive's partition table is likely written in a way"
+    say "  macOS refuses — a PC can read past it where macOS will not."
+    say ""
+    say "  ${B}Recover the files from the PC that does see it${N}, then reformat"
+    say "  as exFAT (Disk Utility → Erase → exFAT, scheme GUID). That is the"
+    say "  only format both systems read and write natively."
+}
+
 # Reading a disk sector by sector fails with "Resource busy" while any of its
 # volumes are mounted, so unmount first. Returns 0 if the disk was mounted, so
 # the caller can remount it afterwards and leave things as it found them.
@@ -186,11 +284,7 @@ if [ -z "$EXTERNALS" ]; then
     # drive looks like. Ejecting detaches the device entirely, so nothing is
     # left to diagnose even though the hardware is fine and still plugged in.
     # ioreg sees the hardware either way, which tells the two apart.
-    USBHW=$(ioreg -p IOUSB -w0 2>/dev/null \
-        | grep -oE '\+-o [^@]+@' \
-        | sed 's/^+-o //; s/@$//' \
-        | grep -viE 'hub|root|xhci|composite|keyboard|mouse|trackpad|camera|audio|receiver|bluetooth' \
-        | head -5)
+    USBHW=$(usb_devices | head -5)
 
     if [ -n "$USBHW" ]; then
         say ""
@@ -198,32 +292,49 @@ if [ -z "$EXTERNALS" ]; then
         printf '%s\n' "$USBHW" | sed 's/^/  · /' | tee -a "$LOG"
         say ""
         say "The drive is plugged in and the Mac sees it on the USB bus — it has"
-        say "just been ${B}ejected${N}, which detaches the device completely."
-        say ""
-        say "${B}Unplug it and plug it back in${N}, then run this again."
+        say "probably been ${B}ejected${N}, which detaches the device completely."
         say ""
         say "${DIM}Ejecting (⏏ in Finder) is not the same as unmounting: a drive${N}"
         say "${DIM}that is merely unmounted still appears here, and that is the${N}"
         say "${DIM}state a damaged drive is normally in.${N}"
+        say ""
+        say "${B}Unplug the drive and plug it back in now.${N}"
+        say ""
+
+        # Wait rather than making the user run the whole thing again.
+        if wait_for_disk 60; then
+            ok "Drive detected — continuing"
+            EXTERNALS=$(diskutil list external physical 2>/dev/null | grep -Eo '^/dev/disk[0-9]+' | sort -u)
+        else
+            warn "Nothing appeared after 60 seconds."
+            say ""
+            say "If you did replug it and it still does not show up, the drive"
+            say "is not being recognised. See the checks below."
+            say ""
+            diagnose_absent
+            exit 0
+        fi
     else
         say ""
-        say "${B}What this means${N}"
-        say "  The Mac is not detecting the drive even at the hardware level."
-        say "  The fault is upstream of the filesystem."
+        say "The Mac sees no storage device on the USB bus either."
         say ""
-        say "${B}Check, in this order${N}"
-        say "  1. Try a different USB port — try every port"
-        say "  2. Try a different USB-C adapter or hub — a very common cause"
-        say "  3. Plug in directly, with no hub and no extension cable"
-        say "  4. Reset the Mac's NVRAM / SMC"
+        say "${B}Plug the drive in now${N} (or unplug and replug it)."
         say ""
-        say "If the drive works on Windows but appears on no Mac, and nothing is"
-        say "listed above, the adapter is the prime suspect."
-        say ""
-        say "USB system log, last 5 minutes:"
-        log show --last 5m --predicate 'subsystem CONTAINS "usb"' --style compact 2>/dev/null \
-            | tail -40 | tee -a "$LOG"
+
+        if wait_for_disk 60; then
+            ok "Drive detected — continuing"
+            EXTERNALS=$(diskutil list external physical 2>/dev/null | grep -Eo '^/dev/disk[0-9]+' | sort -u)
+        else
+            say ""
+            diagnose_absent
+            exit 0
+        fi
     fi
+fi
+
+# Both branches above may have found a drive while waiting.
+if [ -z "$EXTERNALS" ]; then
+    diagnose_absent
     exit 0
 fi
 
