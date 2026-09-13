@@ -64,6 +64,22 @@ ask() {
 
 die() { say ""; bad "$*"; say ""; exit 1; }
 
+# /dev/diskN -> /dev/rdiskN, the raw character device.
+# Note: bash pattern substitution is not sed — escaping the slashes as \/
+# would insert literal backslashes into the result.
+rawdev() { printf '%s' "${1/#\/dev\///dev/r}"; }
+
+# Reading a disk sector by sector fails with "Resource busy" while any of its
+# volumes are mounted, so unmount first. Returns 0 if the disk was mounted, so
+# the caller can remount it afterwards and leave things as it found them.
+unmount_disk() {
+    if diskutil list "$1" 2>/dev/null | grep -q "/Volumes/"; then
+        diskutil unmountDisk "$1" >/dev/null 2>&1
+        return 0
+    fi
+    return 1
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Cleanup — always runs, even on Ctrl+C
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,12 +222,23 @@ diskutil info "$DISK" 2>&1 | tee -a "$LOG" | grep -E \
     | sed 's/^/  /'
 
 # Does the drive respond physically? Read the first sector.
+#
+# The drive must be unmounted first: macOS refuses raw reads of a mounted disk
+# with "Resource busy", which would otherwise look exactly like failing
+# hardware. It is remounted immediately afterwards.
+#
 # Note: dd's exit status is checked directly, not through a pipe — a pipeline
 # reports the status of its last command, which would mask a dd failure.
 say ""
 say "${B}Physical read test${N}"
 PHYS_OK=1
+REMOUNT=0
 if [ "$SUDO_OK" -eq 1 ]; then
+    if unmount_disk "$DISK"; then
+        REMOUNT=1
+        info "Temporarily unmounted for the read test"
+    fi
+
     if sudo dd if="$DISK" of=/dev/null bs=512 count=1 2>>"$LOG"; then
         ok "First sector reads correctly"
     else
@@ -238,10 +265,13 @@ say "${B}Partition table${N}"
 PARTSCHEME=$(diskutil info "$DISK" 2>/dev/null | awk -F': *' '/Content \(IOContent\)/{print $2; exit}')
 info "Scheme: ${PARTSCHEME:-unknown}"
 
-if gpt -r show "$DISK" >>"$LOG" 2>&1; then
-    ok "Partition table readable"
-else
-    warn "Partition table unreadable or absent (details in the report)"
+# gpt needs root, like the raw reads above.
+if [ "$SUDO_OK" -eq 1 ]; then
+    if sudo gpt -r show "$DISK" >>"$LOG" 2>&1; then
+        ok "Partition table readable"
+    else
+        info "No GPT table (normal for a FAT/MBR drive — see the report)"
+    fi
 fi
 
 # Boot sector signature — distinguishes MBR / GPT from a wiped table.
@@ -253,6 +283,13 @@ if [ "$SUDO_OK" -eq 1 ]; then
         warn "Unexpected boot sector signature: 0x$SIG (expected 55AA)"
         warn "The partition table is probably corrupt."
     fi
+fi
+
+# Put the drive back the way it was found, so the checks below see the real
+# mount state rather than one this script created.
+if [ "$REMOUNT" -eq 1 ]; then
+    diskutil mountDisk "$DISK" >/dev/null 2>&1
+    sleep 1
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +304,18 @@ while IFS= read -r line; do
     [ -n "$line" ] && PARTS+=("$line")
 done < <(diskutil list "$DISK" 2>/dev/null | grep -Eo "${DISKNAME}s[0-9]+" | sort -u)
 
+# A drive formatted without a partition table — common on small FAT16/FAT32
+# sticks, shown by macOS as "Scheme: None" — carries its filesystem on the
+# whole device. There is no diskNs1 to find, so analyse the device itself.
+WHOLE_DISK_FS=0
+if [ ${#PARTS[@]} -eq 0 ]; then
+    WHOLE_FSTYPE=$(diskutil info "$DISK" 2>/dev/null | awk -F': *' '/Type \(Bundle\)/{print $2; exit}')
+    if [ -n "$WHOLE_FSTYPE" ]; then
+        PARTS=("$DISKNAME")
+        WHOLE_DISK_FS=1
+    fi
+fi
+
 NTFS_FOUND=0
 BROKEN_PARTS=()
 
@@ -274,6 +323,8 @@ if [ ${#PARTS[@]} -eq 0 ]; then
     bad "No partitions found on $DISK"
     warn "The disk is visible, but its partition table is empty or unreadable."
 else
+    [ "$WHOLE_DISK_FS" -eq 1 ] && \
+        info "No partition table — the filesystem is on the whole device (normal for a small FAT drive)"
     for p in "${PARTS[@]}"; do
         DEV="/dev/$p"
         FSTYPE=$(diskutil info "$DEV" 2>/dev/null | awk -F': *' '/Type \(Bundle\)/{print $2; exit}')
@@ -345,7 +396,7 @@ elif [ "$PHYS_OK" -eq 0 ]; then
     say "  Software repair will not fix this. The priority is copying"
     say "  whatever is still readable before it degrades further."
 elif [ ${#PARTS[@]} -eq 0 ]; then
-    bad "Partition table missing or unreadable."
+    bad "Partition table missing or unreadable, and no filesystem on the device."
     say ""
     say "  The data is most likely still there, but macOS no longer knows"
     say "  where it starts. Do not reformat."
@@ -370,7 +421,7 @@ if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; t
 
     # Compare in bytes rather than the human-readable strings, so the decision
     # is exact. Both values are parsed from their respective tools' output.
-    DISKSIZE=$(diskutil info "$DISK" 2>/dev/null | awk -F': *' '/Disk Size/{print $2; exit}')
+    DISKSIZE=$(diskutil info "$DISK" 2>/dev/null | awk -F': *' '/Disk Size/{print $2; exit}' | awk -F' \\(' '{print $1}')
     DISKBYTES=$(diskutil info "$DISK" 2>/dev/null | awk -F'[()]' '/Disk Size/{print $2}' | awk '{print $1}')
     FREEBYTES=$(( $(df -k "$HOME" | tail -1 | awk '{print $4}') * 1024 ))
 
@@ -397,7 +448,7 @@ if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; t
         ok "Enough free space — creating the image automatically"
         say ""
         info "Unmounting the drive..."
-        diskutil unmountDisk "$DISK" >/dev/null 2>&1
+        unmount_disk "$DISK"
 
         say ""
         say "${B}Copying.${N} This can take a while — minutes to hours depending"
@@ -408,7 +459,7 @@ if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; t
         # /dev/rdiskN is the raw character device: much faster than /dev/diskN.
         # conv=noerror,sync keeps going past bad sectors, padding them with
         # zeroes so that everything after them stays correctly aligned.
-        RAW="${DISK/\/dev\//\/dev\/r}"
+        RAW=$(rawdev "$DISK")
         if sudo dd if="$RAW" of="$LOGDIR/drive-image.dmg" bs=1m conv=noerror,sync status=progress 2>>"$LOG"; then
             say ""
             ok "Image created: $LOGDIR/drive-image.dmg"
@@ -513,7 +564,7 @@ if [ "$NEED_REPAIR" -eq 1 ] && [ "$SUDO_OK" -eq 1 ]; then
                     warn "Repair did not succeed"
                     # Second pass with the low-level checkers, which are more
                     # aggressive than diskutil's wrapper.
-                    RDEV="${DEV/\/dev\//\/dev\/r}"
+                    RDEV=$(rawdev "$DEV")
                     case "$FSTYPE" in
                         msdos|fat32) info "Second attempt (fsck_msdos)..."; sudo fsck_msdos -y "$RDEV" 2>&1 | tail -15 | tee -a "$LOG" | sed 's/^/  /' ;;
                         exfat)       info "Second attempt (fsck_exfat)..."; sudo fsck_exfat -y "$RDEV" 2>&1 | tail -15 | tee -a "$LOG" | sed 's/^/  /' ;;
