@@ -321,7 +321,18 @@ say "  macOS requires admin rights to read a disk sector by sector and to"
 say "  run the repair tools. Without them this script would wrongly report"
 say "  a healthy drive as failing."
 say ""
-if sudo -v 2>/dev/null; then
+# sudo must read the password from the terminal, not from stdin: this script
+# is normally launched from a file after curl, and any redirection on stdin
+# makes sudo fail silently rather than prompt. 2>/dev/null would also swallow
+# the prompt itself, so it is not used here.
+if [ -t 0 ] || [ -e /dev/tty ]; then
+    sudo -v < /dev/tty
+    SUDO_RC=$?
+else
+    SUDO_RC=1
+fi
+
+if [ "$SUDO_RC" -eq 0 ]; then
     ok "Administrator rights granted"
     SUDO_OK=1
     # Keep the sudo timestamp alive for the duration of the run.
@@ -551,6 +562,7 @@ fi
 
 NTFS_FOUND=0
 BROKEN_PARTS=()
+DEVICE_DROPPED=0
 
 if [ ${#PARTS[@]} -eq 0 ]; then
     bad "No partitions found on $DISK"
@@ -592,6 +604,15 @@ else
                 printf '%s\n' "$VERIFY" >> "$LOG"
                 if printf '%s' "$VERIFY" | grep -qiE "appears to be OK|seems to be OK"; then
                     ok "Filesystem is healthy"
+                elif printf '%s' "$VERIFY" | grep -qiE "Device not configured|Input/output error|error 204|error 5|not responding"; then
+                    # The device dropped off the bus mid-scan. That is hardware
+                    # failing under load, not filesystem damage, and repairing
+                    # would write to a drive that cannot be trusted to stay
+                    # present — so it is deliberately kept out of BROKEN_PARTS.
+                    bad "The drive disconnected during the check"
+                    printf '%s' "$VERIFY" | grep -iE "Device not configured|Input/output|exit code" \
+                        | head -3 | sed 's/^/      /' | tee -a "$LOG"
+                    DEVICE_DROPPED=1
                 else
                     bad "Filesystem is corrupt"
                     printf '%s' "$VERIFY" | grep -iE "error|corrupt|invalid|bad|incorrect" \
@@ -614,7 +635,37 @@ fi
 title "4. Verdict"
 
 NEED_REPAIR=0
-if [ ${#BROKEN_PARTS[@]} -gt 0 ]; then
+if [ "${DEVICE_DROPPED:-0}" -eq 1 ]; then
+    bad "The drive stopped responding while being read."
+    say ""
+    say "${B}Interpretation${N}"
+    say "  This is not filesystem damage. The drive disconnected itself from"
+    say "  the USB bus partway through the scan — it fails under sustained"
+    say "  reading. Common causes are a failing controller, overheating, or"
+    say "  a port that cannot supply enough power."
+    say ""
+    say "  ${B}No repair will be attempted.${N} Writing to a drive that drops off"
+    say "  mid-operation is how a recoverable disk becomes an unrecoverable"
+    say "  one."
+    say ""
+    say "${B}What to do, in order${N}"
+    say ""
+    say "  ${B}1.${N} Copy the files off it now, in small batches."
+    say "     Work through a few folders at a time rather than dragging"
+    say "     everything at once — long transfers are what trigger the drop."
+    say "     Let the drive cool down between batches if it feels warm."
+    say ""
+    say "  ${B}2.${N} Try a powered USB hub, or a different port."
+    say "     A 1 TB drive drawing more than a port provides will behave"
+    say "     exactly like this."
+    say ""
+    say "  ${B}3.${N} Use the PC that already reads it."
+    say "     Windows is the better rescue platform here, and this drive"
+    say "     reportedly works there."
+    say ""
+    say "  ${B}Do not reformat and do not run repair tools on it${N} until the"
+    say "  files are safely copied elsewhere."
+elif [ ${#BROKEN_PARTS[@]} -gt 0 ]; then
     bad "Partition(s) needing repair: ${BROKEN_PARTS[*]}"
     say ""
     say "${B}Interpretation${N}"
@@ -645,7 +696,17 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 IMAGE_DONE=0
 BACKUP_SKIP_REASON=""
-if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; then
+if [ "${DEVICE_DROPPED:-0}" -eq 1 ]; then
+    # A full-disk image of a drive that disconnects mid-read would stall or
+    # produce a truncated file, and the reading itself stresses the drive
+    # further. Copying the files matters more than imaging the device.
+    title "5. Backup"
+    warn "No disk image will be made."
+    say ""
+    say "  Imaging reads the whole drive from end to end, which is exactly"
+    say "  the sustained load this drive fails under. Copy the files you"
+    say "  need instead, a few folders at a time."
+elif [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; then
     title "5. Backup"
 
     say "A problem was found, so the whole drive is copied into an image file"
@@ -865,7 +926,9 @@ if [ "$IMAGE_DONE" -eq 1 ]; then
 fi
 say ""
 
-if [ ${#BROKEN_PARTS[@]} -gt 0 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; then
+if [ "${DEVICE_DROPPED:-0}" -eq 1 ]; then
+    :
+elif [ ${#BROKEN_PARTS[@]} -gt 0 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; then
     say "${B}If the drive is still inaccessible${N}"
     say ""
     say "  ${B}1.${N} Recover the data first, before anything else"
