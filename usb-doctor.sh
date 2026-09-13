@@ -69,12 +69,27 @@ die() { say ""; bad "$*"; say ""; exit 1; }
 # would insert literal backslashes into the result.
 rawdev() { printf '%s' "${1/#\/dev\///dev/r}"; }
 
+# Human-readable size for a device, without diskutil's byte-count suffixes:
+# "2.0 GB" rather than "2.0 GB (1992294400 Bytes) (exactly 3891200 ...)".
+disk_size() {
+    diskutil info "$1" 2>/dev/null \
+        | awk -F': *' '/(Disk|Volume) Size/{print $2; exit}' \
+        | awk -F' \\(' '{print $1}'
+}
+
 # Reading a disk sector by sector fails with "Resource busy" while any of its
 # volumes are mounted, so unmount first. Returns 0 if the disk was mounted, so
 # the caller can remount it afterwards and leave things as it found them.
 unmount_disk() {
-    if diskutil list "$1" 2>/dev/null | grep -q "/Volumes/"; then
+    # "diskutil list" only prints /Volumes/ for partitioned drives; a disk
+    # holding its filesystem directly shows just the volume name. Ask
+    # "diskutil info" instead, which answers for both layouts.
+    local mounted
+    mounted=$(diskutil info "$1" 2>/dev/null | awk -F': *' '/^ *Mounted/{print $2; exit}')
+
+    if [ "$mounted" = "Yes" ] || diskutil list "$1" 2>/dev/null | grep -q "/Volumes/"; then
         diskutil unmountDisk "$1" >/dev/null 2>&1
+        sleep 1
         return 0
     fi
     return 1
@@ -99,7 +114,18 @@ cleanup() {
         INSTALLED_BY_US=()
     fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+
+# Ctrl+C must actually stop the run. With cleanup alone on INT the shell
+# resumes at the next statement, which once let an interrupted backup fall
+# through into the repair.
+on_interrupt() {
+    say ""
+    say ""
+    warn "Interrupted. Stopping."
+    exit 130
+}
+trap on_interrupt INT TERM
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Setup
@@ -183,7 +209,7 @@ COUNT=$(echo "$EXTERNALS" | wc -l | tr -d ' ')
 if [ "$COUNT" -eq 1 ]; then
     DISK="$EXTERNALS"
     NAME=$(diskutil info "$DISK" 2>/dev/null | awk -F': *' '/Device \/ Media Name/{print $2; exit}')
-    SIZE=$(diskutil info "$DISK" 2>/dev/null | awk -F': *' '/Disk Size/{print $2; exit}')
+    SIZE=$(disk_size "$DISK")
     say ""
     say "Only one external disk: ${B}$DISK${N} — $NAME ($SIZE)"
     ask "Is this the USB drive to diagnose?" || die "Cancelled. Unplug other external disks and run again."
@@ -195,7 +221,7 @@ else
     OPTIONS=()
     while IFS= read -r d; do
         NAME=$(diskutil info "$d" 2>/dev/null | awk -F': *' '/Device \/ Media Name/{print $2; exit}')
-        SIZE=$(diskutil info "$d" 2>/dev/null | awk -F': *' '/Disk Size/{print $2; exit}')
+        SIZE=$(disk_size "$d")
         say "  ${B}$i${N}) $d — $NAME ($SIZE)"
         OPTIONS+=("$d")
         i=$((i+1))
@@ -330,7 +356,7 @@ else
         FSTYPE=$(diskutil info "$DEV" 2>/dev/null | awk -F': *' '/Type \(Bundle\)/{print $2; exit}')
         FSNAME=$(diskutil info "$DEV" 2>/dev/null | awk -F': *' '/Volume Name/{print $2; exit}')
         MOUNTED=$(diskutil info "$DEV" 2>/dev/null | awk -F': *' '/Mounted/{print $2; exit}')
-        PSIZE=$(diskutil info "$DEV" 2>/dev/null | awk -F': *' '/(Disk|Volume) Size/{print $2; exit}')
+        PSIZE=$(disk_size "$DEV")
 
         say ""
         say "${B}$DEV${N} — ${FSNAME:-unnamed} (${FSTYPE:-unknown type}, ${PSIZE:-?})"
@@ -421,7 +447,7 @@ if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; t
 
     # Compare in bytes rather than the human-readable strings, so the decision
     # is exact. Both values are parsed from their respective tools' output.
-    DISKSIZE=$(diskutil info "$DISK" 2>/dev/null | awk -F': *' '/Disk Size/{print $2; exit}' | awk -F' \\(' '{print $1}')
+    DISKSIZE=$(disk_size "$DISK")
     DISKBYTES=$(diskutil info "$DISK" 2>/dev/null | awk -F'[()]' '/Disk Size/{print $2}' | awk '{print $1}')
     FREEBYTES=$(( $(df -k "$HOME" | tail -1 | awk '{print $4}') * 1024 ))
 
@@ -460,18 +486,32 @@ if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; t
         # conv=noerror,sync keeps going past bad sectors, padding them with
         # zeroes so that everything after them stays correctly aligned.
         RAW=$(rawdev "$DISK")
-        if sudo dd if="$RAW" of="$LOGDIR/drive-image.dmg" bs=1m conv=noerror,sync status=progress 2>>"$LOG"; then
-            say ""
+        sudo dd if="$RAW" of="$LOGDIR/drive-image.dmg" bs=1m conv=noerror,sync status=progress 2>>"$LOG"
+        DD_STATUS=$?
+
+        # The image must be verified by size, not by mere existence: an
+        # interrupted copy (Ctrl+C) still leaves a file behind, and treating
+        # that as a valid backup would unlock the repair with no real safety
+        # net. dd is allowed to fall short by one block from rounding.
+        IMGBYTES=0
+        [ -f "$LOGDIR/drive-image.dmg" ] && \
+            IMGBYTES=$(stat -f%z "$LOGDIR/drive-image.dmg" 2>/dev/null || echo 0)
+
+        say ""
+        if [ "$IMGBYTES" -ge $(( DISKBYTES - 1048576 )) ]; then
             ok "Image created: $LOGDIR/drive-image.dmg"
             ok "Unreadable sectors were zero-filled rather than aborting the copy."
             IMAGE_DONE=1
+        elif [ "$DD_STATUS" -ge 128 ]; then
+            # 128+n means killed by signal n — Ctrl+C is 130.
+            BACKUP_SKIP_REASON="the backup was interrupted"
+            bad "Backup interrupted at $(( IMGBYTES / 1000000 )) MB of $(( DISKBYTES / 1000000 )) MB"
+            rm -f "$LOGDIR/drive-image.dmg"
+            info "Incomplete image deleted."
         else
-            warn "The copy finished with errors (see the report)."
-            if [ -f "$LOGDIR/drive-image.dmg" ]; then
-                IMAGE_DONE=1
-            else
-                BACKUP_SKIP_REASON="the backup copy failed"
-            fi
+            BACKUP_SKIP_REASON="the backup copy was incomplete"
+            bad "Backup incomplete: $(( IMGBYTES / 1000000 )) MB of $(( DISKBYTES / 1000000 )) MB"
+            warn "Keeping the partial image, but it is NOT a usable backup."
         fi
     fi
 fi
@@ -556,9 +596,17 @@ if [ "$NEED_REPAIR" -eq 1 ] && [ "$SUDO_OK" -eq 1 ]; then
                 # FAT / exFAT / HFS+ / APFS — native macOS tools, nothing to install.
                 diskutil unmount "$DEV" >/dev/null 2>&1
                 REPAIR=$(diskutil repairVolume "$DEV" 2>&1)
+                REPAIR_STATUS=$?
                 printf '%s\n' "$REPAIR" >> "$LOG"
                 printf '%s' "$REPAIR" | tail -20 | sed 's/^/  /'
-                if printf '%s' "$REPAIR" | grep -qiE "appears to be OK|was repaired successfully|seems to be OK"; then
+
+                # Judge by exit status, not by matching prose: diskutil reports
+                # a successful repair as "File system check exit code is 0" and
+                # "Finished file system repair", neither of which matches the
+                # "appears to be OK" wording that verifyVolume uses.
+                say ""
+                if [ "$REPAIR_STATUS" -eq 0 ] || \
+                   printf '%s' "$REPAIR" | grep -qiE "exit code is 0|appears to be OK|was repaired successfully|seems to be OK"; then
                     ok "Repair succeeded"
                 else
                     warn "Repair did not succeed"
