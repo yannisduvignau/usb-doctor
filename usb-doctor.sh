@@ -179,24 +179,51 @@ EXTERNALS=$(diskutil list external physical 2>/dev/null | grep -Eo '^/dev/disk[0
 
 if [ -z "$EXTERNALS" ]; then
     say ""
-    bad "macOS sees no external disk at all."
-    say ""
-    say "${B}What this means${N}"
-    say "  The Mac is not detecting the drive even at the hardware level."
-    say "  The fault is upstream of the filesystem."
-    say ""
-    say "${B}Check, in this order${N}"
-    say "  1. Try a different USB port — try every port"
-    say "  2. Try a different USB-C adapter or hub — a very common cause"
-    say "  3. Plug in directly, with no hub and no extension cable"
-    say "  4. Reset the Mac's NVRAM / SMC"
-    say ""
-    say "If the drive works on Windows but appears on no Mac, and nothing is"
-    say "listed above, the adapter is the prime suspect."
-    say ""
-    say "USB system log, last 5 minutes:"
-    log show --last 5m --predicate 'subsystem CONTAINS "usb"' --style compact 2>/dev/null \
-        | tail -40 | tee -a "$LOG"
+    bad "macOS lists no external disk."
+
+    # "Ejected" and "unmounted" are different states, and only one of them is a
+    # fault. Unmounting leaves /dev/diskN in place — that is what a damaged
+    # drive looks like. Ejecting detaches the device entirely, so nothing is
+    # left to diagnose even though the hardware is fine and still plugged in.
+    # ioreg sees the hardware either way, which tells the two apart.
+    USBHW=$(ioreg -p IOUSB -w0 2>/dev/null \
+        | grep -oE '\+-o [^@]+@' \
+        | sed 's/^+-o //; s/@$//' \
+        | grep -viE 'hub|root|xhci|composite|keyboard|mouse|trackpad|camera|audio|receiver|bluetooth' \
+        | head -5)
+
+    if [ -n "$USBHW" ]; then
+        say ""
+        say "${B}But the hardware IS connected${N}"
+        printf '%s\n' "$USBHW" | sed 's/^/  · /' | tee -a "$LOG"
+        say ""
+        say "The drive is plugged in and the Mac sees it on the USB bus — it has"
+        say "just been ${B}ejected${N}, which detaches the device completely."
+        say ""
+        say "${B}Unplug it and plug it back in${N}, then run this again."
+        say ""
+        say "${DIM}Ejecting (⏏ in Finder) is not the same as unmounting: a drive${N}"
+        say "${DIM}that is merely unmounted still appears here, and that is the${N}"
+        say "${DIM}state a damaged drive is normally in.${N}"
+    else
+        say ""
+        say "${B}What this means${N}"
+        say "  The Mac is not detecting the drive even at the hardware level."
+        say "  The fault is upstream of the filesystem."
+        say ""
+        say "${B}Check, in this order${N}"
+        say "  1. Try a different USB port — try every port"
+        say "  2. Try a different USB-C adapter or hub — a very common cause"
+        say "  3. Plug in directly, with no hub and no extension cable"
+        say "  4. Reset the Mac's NVRAM / SMC"
+        say ""
+        say "If the drive works on Windows but appears on no Mac, and nothing is"
+        say "listed above, the adapter is the prime suspect."
+        say ""
+        say "USB system log, last 5 minutes:"
+        log show --last 5m --predicate 'subsystem CONTAINS "usb"' --style compact 2>/dev/null \
+            | tail -40 | tee -a "$LOG"
+    fi
     exit 0
 fi
 
