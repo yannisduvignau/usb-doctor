@@ -175,6 +175,69 @@ diagnose_absent() {
     say "  only format both systems read and write natively."
 }
 
+# Draws a progress bar for a copy in flight, by watching the output file grow.
+#
+# macOS ships BSD dd, whose status=progress prints nothing until the copy ends
+# — it is a GNU option. So progress is measured from the file itself rather
+# than parsed from dd's output.
+#
+# $1 pid of the running dd, $2 destination path, $3 expected total bytes
+show_copy_progress() {
+    local pid="$1" dest="$2" total="$3"
+    local width=32 done_b=0 pct=0 filled=0 started elapsed rate eta
+    started=$(date +%s)
+
+    # Nothing to draw without a terminal; just wait for the copy.
+    if [ ! -t 1 ] || [ "${total:-0}" -le 0 ]; then
+        wait "$pid" 2>/dev/null
+        return $?
+    fi
+
+    while kill -0 "$pid" 2>/dev/null; do
+        done_b=$(stat -f%z "$dest" 2>/dev/null || echo 0)
+        [ "$done_b" -gt "$total" ] && done_b="$total"
+        pct=$(( done_b * 100 / total ))
+        filled=$(( pct * width / 100 ))
+
+        elapsed=$(( $(date +%s) - started ))
+        rate=0
+        [ "$elapsed" -gt 0 ] && rate=$(( done_b / elapsed ))
+
+        # Remaining time, once there is enough of a rate to extrapolate from.
+        eta=""
+        if [ "$rate" -gt 0 ] && [ "$done_b" -lt "$total" ]; then
+            local secs=$(( (total - done_b) / rate ))
+            if [ "$secs" -ge 60 ]; then
+                eta=$(printf '%dm%02ds left' $(( secs / 60 )) $(( secs % 60 )))
+            else
+                eta="${secs}s left"
+            fi
+        fi
+
+        printf '\r  [%s%s] %3d%%  %d/%d MB  %s' \
+            "$(printf '%*s' "$filled" '' | tr ' ' '#')" \
+            "$(printf '%*s' "$(( width - filled ))" '')" \
+            "$pct" \
+            "$(( done_b / 1000000 ))" "$(( total / 1000000 ))" \
+            "$(printf '%-14s' "${eta:-…}")"
+        sleep 1
+    done
+
+    wait "$pid" 2>/dev/null
+    local status=$?
+
+    # Final state, so the line does not stop at 99%.
+    done_b=$(stat -f%z "$dest" 2>/dev/null || echo 0)
+    [ "$done_b" -gt "$total" ] && done_b="$total"
+    pct=$(( done_b * 100 / total ))
+    filled=$(( pct * width / 100 ))
+    printf '\r  [%s%s] %3d%%  %d/%d MB  %-14s\n' \
+        "$(printf '%*s' "$filled" '' | tr ' ' '#')" \
+        "$(printf '%*s' "$(( width - filled ))" '')" \
+        "$pct" "$(( done_b / 1000000 ))" "$(( total / 1000000 ))" ""
+    return $status
+}
+
 # Reading a disk sector by sector fails with "Resource busy" while any of its
 # volumes are mounted, so unmount first. Returns 0 if the disk was mounted, so
 # the caller can remount it afterwards and leave things as it found them.
@@ -218,6 +281,12 @@ trap cleanup EXIT
 # resumes at the next statement, which once let an interrupted backup fall
 # through into the repair.
 on_interrupt() {
+    # dd runs in the background under sudo, so Ctrl+C does not reach it: the
+    # copy would keep running after the script exits. Stop it explicitly.
+    if [ -n "${DD_PID:-}" ] && kill -0 "$DD_PID" 2>/dev/null; then
+        sudo kill "$DD_PID" 2>/dev/null
+        wait "$DD_PID" 2>/dev/null
+    fi
     say ""
     say ""
     warn "Interrupted. Stopping."
@@ -615,8 +684,8 @@ if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; t
         unmount_disk "$DISK"
 
         say ""
-        say "${B}Copying.${N} This can take a while — minutes to hours depending"
-        say "on size and on how damaged the drive is."
+        say "${B}Copying${N} $(( DISKBYTES / 1000000 )) MB. A damaged drive copies slowly —"
+        say "reading past bad sectors takes time."
         say "${DIM}Ctrl+C to abort.${N}"
         say ""
 
@@ -624,7 +693,9 @@ if [ "$NEED_REPAIR" -eq 1 ] || [ "$PHYS_OK" -eq 0 ] || [ ${#PARTS[@]} -eq 0 ]; t
         # conv=noerror,sync keeps going past bad sectors, padding them with
         # zeroes so that everything after them stays correctly aligned.
         RAW=$(rawdev "$DISK")
-        sudo dd if="$RAW" of="$LOGDIR/drive-image.dmg" bs=1m conv=noerror,sync status=progress 2>>"$LOG"
+        sudo dd if="$RAW" of="$LOGDIR/drive-image.dmg" bs=1m conv=noerror,sync 2>>"$LOG" &
+        DD_PID=$!
+        show_copy_progress "$DD_PID" "$LOGDIR/drive-image.dmg" "$DISKBYTES"
         DD_STATUS=$?
 
         # The image must be verified by size, not by mere existence: an
